@@ -1,0 +1,40 @@
+# Python virtual environment
+venv/
+
+# Django database
+db.sqlite3
+
+# Django migrations
+*/migrations/*
+
+# Python bytecode
+*.pyc
+*.pyo
+__pycache__/
+
+# Logs
+*.log
+
+# IDE/Editor folders
+.vscode/
+.idea/
+
+# Dependency directories
+.env/
+*.env
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Pytest cache
+.cache/
+
+# Playwright related files
+playwright/
+
+# Django static files 
+static/
+
+# Test coverage
+coverage/
