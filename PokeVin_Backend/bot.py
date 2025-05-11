@@ -7,6 +7,7 @@ import asyncio
 import random
 import urllib.parse
 import requests
+import re
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -21,6 +22,7 @@ import discord
 from discord.ext import commands
 from django.core.exceptions import ObjectDoesNotExist
 from prices.models import PokemonPrice, WishlistItem
+from prices.scraper import scrape_and_update_cards, normalize_scraped_data, scrape_and_get_name_price
 
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read message text
@@ -31,6 +33,61 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 @bot.event
 async def on_ready():
     print(f'Bot is online as {bot.user}')
+
+@sync_to_async
+def get_all_wishlist_items():
+    return list(WishlistItem.objects.all())
+
+async def check_against_wishlist(scraped_name, user_id):
+    wishlist = await get_user_wishlist(user_id)
+
+    normalized_title = normalize_scraped_data(scraped_name)
+
+    matches = []
+    for item in wishlist:
+        name_match = normalize_scraped_data(item['pokemon_name']) in normalized_title
+        set_keywords = [normalize_scraped_data(word) for word in item['set_name'].split()]
+        set_match = all(kw in normalized_title for kw in set_keywords if len(kw) > 3)
+
+        # Try to match the numeric part of the card_id, e.g. SM96
+        id_match = re.search(r'(\d+)$', item['card_id'])
+        id_part = id_match.group(1) if id_match else ''
+        id_match_found = id_part and id_part.lower() in normalized_title
+
+        if name_match and (set_match or id_match_found):
+            matches.append(item)
+
+    return matches
+
+
+# Scrape and notify users
+@bot.command(name='scrape')
+async def scrape(ctx, url: str):
+    await ctx.send(f"Scraping eBay listing: {url}")
+
+    name, price = await scrape_and_get_name_price(url)  # return name, price from your scraper
+    if not name:
+        await ctx.send("Failed to scrape a title.")
+        return
+
+    matched_items = await check_against_wishlist(name, ctx.author.id)
+
+    if matched_items:
+        try:
+            dm_channel = await ctx.author.create_dm()
+            await dm_channel.send(
+                f"📢 This eBay listing matches one or more cards in your wishlist!\n"
+                f"**Title:** {name}\n"
+                f"**Price:** ${price:.2f}\n"
+                f"**Link:** {url}\n"
+                f"\n**Matched Wishlist Entries:**\n" +
+                "\n".join(f"- {m['pokemon_name']} (Set: {m['set_name']}, ID: {m['card_id']})" for m in matched_items)
+            )
+        except discord.Forbidden:
+            await ctx.send("I couldn't DM you. Please check your privacy settings.")
+    else:
+        await ctx.send("No wishlist matches found for this listing.")
+
 
 async def get_matching_cards(card_name):
     url = f"https://api.pokemontcg.io/v2/cards?q=name:{card_name}"
