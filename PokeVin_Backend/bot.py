@@ -4,6 +4,9 @@ import django
 from asgiref.sync import sync_to_async
 import aiohttp
 import asyncio
+import random
+import urllib.parse
+import requests
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -54,7 +57,6 @@ def check_if_item_exists(user_id, pokemon_name, set_name, card_id):
 # Create a sync function to add a new wishlist item
 @sync_to_async
 def add_wishlist_item(user_id, pokemon_name, set_name, card_id):
-    # Create and save a new WishlistItem with pokemon_name, set_name, and card_id
     WishlistItem.objects.create(
         discord_user_id=user_id,
         pokemon_name=pokemon_name,
@@ -64,25 +66,40 @@ def add_wishlist_item(user_id, pokemon_name, set_name, card_id):
 
 
 async def fetch_cards_by_name(pokemon_name: str):
-    url = f"https://api.pokemontcg.io/v2/cards?q=name:{pokemon_name}"
+    # Encode the pokemon_name to safely use in URL
+    pokemon_name_encoded = urllib.parse.quote(pokemon_name)
 
-    # Perform an asynchronous GET request to the API
+    url = f"https://api.pokemontcg.io/v2/cards?q=name:{pokemon_name_encoded}"
+
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
-            # If the request was successful (status code 200)
             if response.status == 200:
                 data = await response.json()
-
-                # Check if there are any cards in the response data
-                if "data" in data:
-                    return data["data"]
-                else:
-                    return []  # No cards found
-
+                print(f"Fetched data for {pokemon_name}: {data}")  # Debugging line
+                return data.get("data", [])
             else:
-                # Handle API request errors
-                print(f"Error fetching cards for {pokemon_name}: {response.status}")
+                print(f"Error fetching data for {pokemon_name}: {response.status}")  # Debugging line
                 return []
+
+
+# Fetch cards from the external API based on the card ID
+async def fetch_cards_by_id(card_id):
+    url = f"https://api.pokemontcg.io/v2/cards/{card_id}"  # The endpoint to fetch card details by ID
+
+    try:
+        # Make the request to the API
+        response = requests.get(url)
+
+        # Check if the response is valid
+        if response.status_code == 200:
+            card_data = response.json()  # Parse the JSON response
+            return [card_data['data']]  # Return the card data (as a list for consistency with the other fetch function)
+        else:
+            print(f"Error fetching card by ID {card_id}: {response.status_code}")
+            return []  # Return an empty list if no data is found or if the API request fails
+    except Exception as e:
+        print(f"Error fetching card by ID {card_id}: {e}")
+        return []  # Return an empty list in case of any exception
 
 
 # Modify the add_wishlist command to suggest cards
@@ -93,6 +110,25 @@ async def add_to_wishlist(ctx, *, card_info: str):
     # Split the input by commas
     parts = [part.strip() for part in card_info.split(',')]
 
+    # If user only provided the Pokémon name, suggest a random card
+    if len(parts) == 1:
+        pokemon_name = parts[0]
+        cards = await fetch_cards_by_name(pokemon_name)
+
+        if not cards:
+            await ctx.send(f"No cards found matching '{pokemon_name}'. Please try again with a valid name.")
+            return
+
+        suggested = random.choice(cards)
+        example_text = (
+            f"Invalid format! Please use:\n"
+            f"`!add_wishlist <pokemon_name>, <set_name>, <card_id>`\n"
+            f"For example, based on what you typed:\n"
+            f"`!add_wishlist {suggested['name']}, {suggested['set']['name']}, {suggested['id']}`"
+        )
+        await ctx.send(example_text)
+        return
+
     # Ensure there are exactly 3 parts (pokemon_name, set_name, card_id)
     if len(parts) != 3:
         await ctx.send("Invalid format! Please use the format: `!add_wishlist <pokemon_name>, <set_name>, <id>`.")
@@ -101,12 +137,17 @@ async def add_to_wishlist(ctx, *, card_info: str):
     # Extract pokemon_name, set_name, and card_id from the input
     pokemon_name, set_name, card_id = parts
 
-    # Fetch cards matching the pokemon_name
+    # First, try to fetch the card by name
     cards = await fetch_cards_by_name(pokemon_name)
 
-    # If no cards are found, let the user know
     if not cards:
-        await ctx.send(f"No cards found matching '{pokemon_name}'. Please try again with a valid name.")
+        # If no cards are found by name, try fetching by card ID
+        cards = await fetch_cards_by_id(card_id)
+
+    # If no cards are found by name or ID, let the user know
+    if not cards:
+        await ctx.send(
+            f"No cards found matching '{pokemon_name}' (Set: {set_name}, ID: {card_id}). Please try again with a valid name or ID.")
         return
 
     # Check if any of the fetched cards match the exact set and ID
@@ -117,16 +158,24 @@ async def add_to_wishlist(ctx, *, card_info: str):
             break
 
     if matched_card:
-        # If a matching card is found, check if it's already in the user's wishlist
-        if await check_if_item_exists(user.id, pokemon_name, set_name, card_id):
-            await ctx.send(f"{pokemon_name} (Set: {set_name}, ID: {card_id}) is already in your wishlist!")
-        else:
-            # Add the matched card to the wishlist with full details
-            await add_wishlist_item(user.id, pokemon_name, set_name, card_id)
-            await ctx.send(f"{matched_card['name']} (Set: {set_name}, ID: {card_id}) has been added to your wishlist!")
+        # If a matching card is found, add it to the wishlist
+        await add_wishlist_item(user.id, matched_card["name"], set_name, card_id)
+
+        # Create an embed with the card image and information
+        embed = discord.Embed(
+            title=f"{matched_card['name']} Added to Wishlist",
+            description=f"Set: {set_name}\nCard ID: {card_id}",
+            color=discord.Color.blue()
+        )
+        embed.set_image(url=matched_card['images']['large'])  # Assuming the image URL is in 'large' field
+
+        # Send the embed
+        await ctx.send(embed=embed)
+
     else:
         # If no matching card is found with the exact set and ID
-        await ctx.send(f"No card found matching '{pokemon_name}' (Set: {set_name}, ID: {card_id}). Please try again with the correct details.")
+        await ctx.send(
+            f"No card found matching '{pokemon_name}' (Set: {set_name}, ID: {card_id}). Please try again with the correct details.")
 
 
 
@@ -134,49 +183,132 @@ async def add_to_wishlist(ctx, *, card_info: str):
 @sync_to_async
 def get_user_wishlist(user_id):
     wishlist_items = WishlistItem.objects.filter(discord_user_id=user_id)
-    return [item.pokemon_name for item in wishlist_items]
+    return [
+        {
+            "pokemon_name": item.pokemon_name,
+            "set_name": item.set_name,
+            "card_id": item.card_id
+        }
+        for item in wishlist_items
+    ]
+
+
+user_wishlist_cache = {}  # {message_id: {user_id, pokemon_name, set_name, card_id}}
 
 @bot.command(name='wishlist')
 async def view_wishlist(ctx):
-    user = ctx.author  # Get the current user
-
-    # Get the user's wishlist asynchronously
+    user = ctx.author
     wishlist = await get_user_wishlist(user.id)
 
     if not wishlist:
         await ctx.send("Your wishlist is currently empty.")
+        return
+
+    await ctx.send(f"{user.mention}, here’s your wishlist! React with ❌ on any to remove:")
+
+    for item in wishlist:
+        content = f"{item['pokemon_name']} (Set: {item['set_name']}, ID: {item['card_id']})"
+        msg = await ctx.send(content)
+        await msg.add_reaction("❌")
+
+        # Cache full card info per message
+        user_wishlist_cache[msg.id] = {
+            "user_id": user.id,
+            "pokemon_name": item['pokemon_name'],
+            "set_name": item['set_name'],
+            "card_id": item['card_id']
+        }
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    if user.bot or str(reaction.emoji) != "❌":
+        return
+
+    msg = reaction.message
+    data = user_wishlist_cache.get(msg.id)
+
+    if not data or user.id != data["user_id"]:
+        return
+
+    success = await remove_from_user_wishlist(
+        user.id,
+        data["pokemon_name"],
+        data["set_name"],
+        data["card_id"]
+    )
+
+    if success:
+        await msg.edit(content=f"✅ Removed: {data['pokemon_name']} (Set: {data['set_name']}, ID: {data['card_id']})")
+        del user_wishlist_cache[msg.id]
     else:
-        # Format the wishlist into a string for display
-        wishlist_str = "\n".join(wishlist)
-        await ctx.send(f"Your wishlist:\n{wishlist_str}")
+        await msg.channel.send("⚠️ Couldn’t remove that item. It may have already been deleted.", delete_after=5)
+
 
 @sync_to_async
-def remove_from_user_wishlist(user_id, pokemon_name):
+def remove_from_user_wishlist(user_id, pokemon_name, set_name, card_id):
     try:
-        # Try to fetch and delete the wishlist item
-        wishlist_item = WishlistItem.objects.get(discord_user_id=user_id, pokemon_name=pokemon_name)
-        wishlist_item.delete()  # Remove the item from the wishlist
+        wishlist_item = WishlistItem.objects.get(
+            discord_user_id=user_id,
+            pokemon_name=pokemon_name,
+            set_name=set_name,
+            card_id=card_id
+        )
+        wishlist_item.delete()
         return True
     except WishlistItem.DoesNotExist:
-        return False  # Pokémon not found in the wishlist
+        return False
 
 
 @bot.command(name='remove_wishlist')
-async def remove_wishlist(ctx, pokemon_name: str):
-    user = ctx.author  # Get the current user
+async def remove_wishlist(ctx, *, card_info: str):
+    user = ctx.author
 
-    # Try to remove the Pokémon from the user's wishlist asynchronously
-    success = await remove_from_user_wishlist(user.id, pokemon_name)
+    parts = [part.strip() for part in card_info.split(',')]
+
+    if len(parts) != 3:
+        await ctx.send("Invalid format! Please use: `!remove_wishlist <pokemon_name>, <set_name>, <id>`.")
+        return
+
+    pokemon_name, set_name, card_id = parts
+
+    success = await remove_from_user_wishlist(user.id, pokemon_name, set_name, card_id)
 
     if success:
-        await ctx.send(f"{pokemon_name} has been removed from your wishlist.")
+        await ctx.send(f"{pokemon_name} (Set: {set_name}, ID: {card_id}) has been removed from your wishlist.")
     else:
-        await ctx.send(f"{pokemon_name} was not found in your wishlist.")
+        await ctx.send(f"{pokemon_name} (Set: {set_name}, ID: {card_id}) was not found in your wishlist.")
 
+@sync_to_async
+def clear_user_wishlist(user_id):
+    WishlistItem.objects.filter(discord_user_id=user_id).delete()
 
-@bot.command()
-async def ping(ctx):
-    await ctx.send('Pong!')
+@bot.command(name='clear_wishlist')
+async def clear_wishlist(ctx):
+    user = ctx.author
+
+    await clear_user_wishlist(user.id)
+    await ctx.send(f"🧹 Your wishlist has been cleared, {user.mention}.")
+
+@bot.command(name='commands')
+async def show_commands(ctx):
+    command_list = """
+📜 **Available Commands:**
+
+🔹 `!add_wishlist <pokemon_name>, <set_name>, <card_id>`  
+➤ Adds a specific Pokémon card to your wishlist.  
+Example: `!add_wishlist Charizard, Base, base1-4`
+
+🔹 `!remove_wishlist <pokemon_name>, <set_name>, <card_id>`  
+➤ Removes a specific card from your wishlist.  
+Example: `!remove_wishlist Charizard, Base, base1-4`
+
+🔹 `!wishlist`  
+➤ View your current wishlist.
+
+🔹 `!commands`  
+➤ Show this list of commands.
+    """
+    await ctx.send(command_list)
 
 bot.run(TOKEN)
 
